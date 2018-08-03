@@ -1,0 +1,6 @@
+- [ ] Convert between JWT and session ID
+- [ ] Route any request inside
+- [ ] Verify that JWT valid and is white listed, else return 401
+- [ ] Check CSRF
+- [ ] Set security headers X-Frame-Options: DENY, Content-Security-Policy: default-src https:; report-uri /api/report/csp-violation, 
+- [ ] Don't expose any versions in response headers

@@ -1,12 +1,16 @@
 package main // import "github.com/mojlighetsministeriet/gateway"
 
 import (
+	"context"
 	"net/http"
 	"os"
-	"regexp"
 	"strings"
+	"time"
 
 	"github.com/PuerkitoBio/purell"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/client"
 	"github.com/labstack/echo"
 	"github.com/labstack/echo-contrib/session"
 	"github.com/mojlighetsministeriet/storage/sessionstore"
@@ -27,29 +31,28 @@ func main() {
 		"COOKIE_SECRET",
 		strings.Replace(uuid.Must(uuid.NewV4()).String(), "-", "", -1),
 	)
-	internalDomainSuffix := utils.GetEnv("INTERNAL_DOMAIN_SUFFIX", "localhost")
 	internalDefaultURL := purell.MustNormalizeURLString(
-		utils.GetEnv("INTERNAL_DEFAULT_URL", "http://gui.localhost"),
+		utils.GetEnv("INTERNAL_DEFAULT_URL", "http://gui"),
 		purell.FlagsSafe|purell.FlagRemoveTrailingSlash,
 	)
-	storageURL := purell.MustNormalizeURLString(
-		utils.GetEnv("STORAGE_URL", "http://storage.localhost/sessions"),
+	sessionStorageURL := purell.MustNormalizeURLString(
+		utils.GetEnv("SESSION_STORAGE_URL", "http://storage/sessions"),
 		purell.FlagsSafe|purell.FlagRemoveTrailingSlash,
 	)
 	identityProviderURL := purell.MustNormalizeURLString(
-		utils.GetEnv("IDENTITY_PROVIDER_URL", "http://identity-provider.localhost"),
+		utils.GetEnv("IDENTITY_PROVIDER_URL", "http://identity-provider"),
 		purell.FlagsSafe|purell.FlagRemoveTrailingSlash,
 	)
 
-	server := server.NewServer(useTLS, false, bodyLimit)
+	gateway := server.NewServer(useTLS, false, bodyLimit)
 
-	sessionStore, err := sessionstore.NewStore(storageURL, []byte(cookieSecret))
+	sessionStore, err := sessionstore.NewStore(sessionStorageURL, []byte(cookieSecret))
 	if err != nil {
 		panic(err)
 	}
-	server.Use(session.Middleware(sessionStore))
+	gateway.Use(session.Middleware(sessionStore))
 
-	server.POST("/api/session", func(context echo.Context) error {
+	gateway.POST("/api/session", func(context echo.Context) error {
 		type createTokenBody struct {
 			Email    string `json:"email"`
 			Password string `json:"password"`
@@ -62,22 +65,27 @@ func main() {
 			return context.JSONBlob(http.StatusUnauthorized, []byte("{\"message\":\"Unauthorized\"}"))
 		}
 
-		client, err := httprequest.NewJSONClient()
+		client, clientError := httprequest.NewJSONClient()
+		if clientError != nil {
+			gateway.Logger.Error(clientError)
+			return context.JSONBlob(http.StatusInternalServerError, []byte("{\"message\":\"Internal Server Error\"}"))
+		}
+
 		type jwt struct {
 			Token string `json:"token"`
 		}
 		token := jwt{}
-		err = client.Post(identityProviderURL+"/token", &parameters, &token)
-		if err != nil {
+		requestError := client.Post(identityProviderURL+"/token", &parameters, &token)
+		if requestError != nil {
 			// TODO: Add error handling, differentiate 4xx and 5xx errors
-			server.Logger.Error(err)
+			gateway.Logger.Error(requestError)
 			return context.JSONBlob(http.StatusInternalServerError, []byte("{\"message\":\"Unauthorized\"}"))
 		}
 
 		request := context.Request()
-		session, err := sessionStore.Get(request, "session")
-		if err != nil {
-			server.Logger.Error(err)
+		session, sessionError := sessionStore.Get(request, "session")
+		if sessionError != nil {
+			gateway.Logger.Error(sessionError)
 			return context.JSONBlob(http.StatusInternalServerError, []byte("{\"message\":\"Internal Server Error\"}"))
 		}
 
@@ -90,27 +98,99 @@ func main() {
 		responseWriter := context.Response().Writer
 		err = sessionStore.Save(request, responseWriter, session)
 		if err != nil {
-			server.Logger.Error(err)
+			gateway.Logger.Error(err)
 			return context.JSONBlob(http.StatusInternalServerError, []byte("{\"message\":\"Internal Server Error\"}"))
 		}
 
 		return context.JSONBlob(http.StatusOK, []byte("{\"message\":\"OK\"}"))
 	})
 
-	addInternalDomainSuffixPattern := regexp.MustCompile("^([^/:]+)(.*)$")
-	server.Any("/api/*", func(context echo.Context) error {
-		url := strings.TrimPrefix(context.Request().URL.String(), "/api/")
-		// TODO: think through if this special check should be here or if slashes always should be added
-		if !strings.HasPrefix(url, "localhost:") {
-			url = addInternalDomainSuffixPattern.ReplaceAllString(url, "$1."+internalDomainSuffix+"$2")
+	dockerClient, err := client.NewEnvClient()
+	if err != nil {
+		panic(err)
+	}
+
+	httpClient, err := httprequest.NewJSONClient()
+	if err != nil {
+		panic(err)
+	}
+
+	serviceRegistry := map[string]server.Routes{}
+
+	go func() {
+		filters := filters.NewArgs()
+		filters.Add("label", "gateway-expose")
+		options := types.ServiceListOptions{Filters: filters}
+
+		for {
+			services, err := dockerClient.ServiceList(context.Background(), options)
+			if err != nil {
+				gateway.Logger.Error(err)
+				continue
+			}
+
+			foundServiceRegistry := map[string]server.Routes{}
+			for _, service := range services {
+				networks := service.Spec.TaskTemplate.Networks
+				for _, network := range networks {
+					for _, alias := range network.Aliases {
+						routes := server.Routes{}
+						routesError := httpClient.Get("http://"+alias+"/help", &routes)
+						if routesError == nil {
+							foundServiceRegistry[alias] = routes
+						} else {
+							gateway.Logger.Error(err)
+						}
+					}
+				}
+			}
+			serviceRegistry = foundServiceRegistry
+
+			time.Sleep(time.Second * 10)
 		}
-		return proxy.Request(context, "http://"+url)
+	}()
+
+	gateway.Any("/api/*", func(context echo.Context) error {
+		url := strings.TrimPrefix(context.Request().URL.String(), "/api/") + "/"
+		serviceDomainName := url[:strings.IndexByte(url, '/')]
+		_, serviceFound := serviceRegistry[serviceDomainName]
+
+		if serviceFound {
+			return proxy.Request(context, "http://"+url)
+		}
+
+		return context.JSONBlob(http.StatusNotFound, []byte("{\"message\":\"Not Found\"}"))
 	})
 
-	server.GET("*", func(context echo.Context) error {
+	gateway.GET("*", func(context echo.Context) error {
 		url := internalDefaultURL + context.Request().URL.String()
 		return proxy.Request(context, url)
 	})
 
-	server.Listen(":" + utils.GetEnv("PORT", "443"))
+	registeredRoutes := server.Routes{}
+	gateway.GET("/help", func(context echo.Context) error {
+		routes := registeredRoutes
+		for serviceName, serviceRoutes := range serviceRegistry {
+			for _, serviceRoute := range serviceRoutes {
+				serviceRoute.Path = "/api/" + serviceName + serviceRoute.Path
+				routes = append(routes, serviceRoute)
+			}
+		}
+
+		routes.Sort()
+
+		return context.JSON(http.StatusOK, routes)
+	})
+
+	for _, route := range gateway.Routes() {
+		if !strings.HasSuffix(route.Path, "/*") {
+			registeredRoute := server.Route{
+				Path:   route.Path,
+				Method: route.Method,
+			}
+			registeredRoutes = append(registeredRoutes, registeredRoute)
+		}
+	}
+
+	gateway.Listen(":" + utils.GetEnv("PORT", "443"))
 }

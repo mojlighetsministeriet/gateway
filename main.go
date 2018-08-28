@@ -1,18 +1,13 @@
 package main // import "github.com/mojlighetsministeriet/gateway"
 
 import (
-	"context"
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
-	"github.com/PuerkitoBio/purell"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/client"
 	"github.com/labstack/echo"
 	"github.com/labstack/echo-contrib/session"
+	"github.com/mojlighetsministeriet/gateway/serviceregistry"
 	"github.com/mojlighetsministeriet/storage/sessionstore"
 	"github.com/mojlighetsministeriet/utils"
 	"github.com/mojlighetsministeriet/utils/httprequest"
@@ -21,37 +16,42 @@ import (
 	uuid "github.com/satori/go.uuid"
 )
 
+const internalDefaultURL = "http://gui"
+const sessionStorageURL = "http://storage/sessions"
+const identityProviderURL = "http://identity-provider"
+
 func main() {
+	// Read configuration
 	useTLS := true
 	if os.Getenv("TLS") == "disable" {
 		useTLS = false
 	}
 	bodyLimit := utils.GetEnv("BODY_LIMIT", "5M")
+
+	// TODO: read as a docker secret instead
 	cookieSecret := utils.GetEnv(
 		"COOKIE_SECRET",
 		strings.Replace(uuid.Must(uuid.NewV4()).String(), "-", "", -1),
 	)
-	internalDefaultURL := purell.MustNormalizeURLString(
-		utils.GetEnv("INTERNAL_DEFAULT_URL", "http://gui"),
-		purell.FlagsSafe|purell.FlagRemoveTrailingSlash,
-	)
-	sessionStorageURL := purell.MustNormalizeURLString(
-		utils.GetEnv("SESSION_STORAGE_URL", "http://storage/sessions"),
-		purell.FlagsSafe|purell.FlagRemoveTrailingSlash,
-	)
-	identityProviderURL := purell.MustNormalizeURLString(
-		utils.GetEnv("IDENTITY_PROVIDER_URL", "http://identity-provider"),
-		purell.FlagsSafe|purell.FlagRemoveTrailingSlash,
-	)
 
+	// Create server
 	gateway := server.NewServer(useTLS, false, bodyLimit)
 
+	// Create service service
+	serviceRegistry, err := serviceregistry.NewServiceRegistry(gateway.Logger)
+	if err != nil {
+		panic(err)
+	}
+	serviceRegistry.UpdateFromDockerSocket()
+
+	// Setup session middleware
 	sessionStore, err := sessionstore.NewStore(sessionStorageURL, []byte(cookieSecret))
 	if err != nil {
 		panic(err)
 	}
 	gateway.Use(session.Middleware(sessionStore))
 
+	// Session management
 	gateway.POST("/api/session", func(context echo.Context) error {
 		type createTokenBody struct {
 			Email    string `json:"email"`
@@ -105,57 +105,11 @@ func main() {
 		return context.JSONBlob(http.StatusOK, []byte("{\"message\":\"OK\"}"))
 	})
 
-	dockerClient, err := client.NewEnvClient()
-	if err != nil {
-		panic(err)
-	}
-
-	httpClient, err := httprequest.NewJSONClient()
-	if err != nil {
-		panic(err)
-	}
-
-	serviceRegistry := map[string]server.Routes{}
-
-	go func() {
-		filters := filters.NewArgs()
-		filters.Add("label", "gateway-expose")
-		options := types.ServiceListOptions{Filters: filters}
-
-		for {
-			services, err := dockerClient.ServiceList(context.Background(), options)
-			if err != nil {
-				gateway.Logger.Error(err)
-				continue
-			}
-
-			foundServiceRegistry := map[string]server.Routes{}
-			for _, service := range services {
-				networks := service.Spec.TaskTemplate.Networks
-				for _, network := range networks {
-					for _, alias := range network.Aliases {
-						routes := server.Routes{}
-						routesError := httpClient.Get("http://"+alias+"/help", &routes)
-						if routesError == nil {
-							foundServiceRegistry[alias] = routes
-						} else {
-							gateway.Logger.Error(err)
-						}
-					}
-				}
-			}
-			serviceRegistry = foundServiceRegistry
-
-			time.Sleep(time.Second * 10)
-		}
-	}()
-
 	gateway.Any("/api/*", func(context echo.Context) error {
 		url := strings.TrimPrefix(context.Request().URL.String(), "/api/") + "/"
 		serviceDomainName := url[:strings.IndexByte(url, '/')]
-		_, serviceFound := serviceRegistry[serviceDomainName]
 
-		if serviceFound {
+		if serviceRegistry.Has(serviceDomainName) || strings.HasPrefix(url, "localhost:") {
 			return proxy.Request(context, "http://"+url)
 		}
 
@@ -170,7 +124,7 @@ func main() {
 	registeredRoutes := server.Routes{}
 	gateway.GET("/help", func(context echo.Context) error {
 		routes := registeredRoutes
-		for serviceName, serviceRoutes := range serviceRegistry {
+		for serviceName, serviceRoutes := range serviceRegistry.Map() {
 			for _, serviceRoute := range serviceRoutes {
 				serviceRoute.Path = "/api/" + serviceName + serviceRoute.Path
 				routes = append(routes, serviceRoute)

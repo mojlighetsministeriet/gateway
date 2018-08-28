@@ -75,11 +75,20 @@ func main() {
 			Token string `json:"token"`
 		}
 		token := jwt{}
-		requestError := client.Post(identityProviderURL+"/token", &parameters, &token)
-		if requestError != nil {
-			// TODO: Add error handling, differentiate 4xx and 5xx errors
-			gateway.Logger.Error(requestError)
-			return context.JSONBlob(http.StatusInternalServerError, []byte("{\"message\":\"Unauthorized\"}"))
+		postError := client.Post(identityProviderURL+"/token", &parameters, &token)
+		if postError != nil {
+			responseError, ok := postError.(httprequest.HTTPError)
+			if ok {
+				if responseError.StatusCode == 401 {
+					return context.JSONBlob(http.StatusUnauthorized, []byte("{\"message\":\"Unauthorized\"}"))
+				} else {
+					gateway.Logger.Error(responseError)
+				}
+			} else {
+				gateway.Logger.Error(postError)
+			}
+
+			return context.JSONBlob(http.StatusInternalServerError, []byte("{\"message\":\"Internal Server Error\"}"))
 		}
 
 		request := context.Request()

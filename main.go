@@ -33,6 +33,7 @@ func main() {
 		"COOKIE_SECRET",
 		strings.Replace(uuid.Must(uuid.NewV4()).String(), "-", "", -1),
 	)
+	cookieDomain := utils.GetEnv("COOKIE_DOMAIN", "momin")
 
 	// Create server
 	gateway := server.NewServer(useTLS, false, bodyLimit)
@@ -45,7 +46,7 @@ func main() {
 	serviceRegistry.UpdateFromDockerSocket()
 
 	// Setup session middleware
-	sessionStore, err := sessionstore.NewStore(sessionStorageURL, []byte(cookieSecret))
+	sessionStore, err := sessionstore.NewStore(sessionStorageURL, cookieDomain, []byte(cookieSecret))
 	if err != nil {
 		panic(err)
 	}
@@ -81,9 +82,9 @@ func main() {
 			if ok {
 				if responseError.StatusCode == 401 {
 					return context.JSONBlob(http.StatusUnauthorized, []byte("{\"message\":\"Unauthorized\"}"))
-				} else {
-					gateway.Logger.Error(responseError)
 				}
+
+				gateway.Logger.Error(responseError)
 			} else {
 				gateway.Logger.Error(postError)
 			}
